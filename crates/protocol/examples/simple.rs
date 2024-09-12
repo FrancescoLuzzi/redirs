@@ -1,8 +1,11 @@
 use std::io;
 
-use protocol::Token;
+use protocol::{RedirsOutput, RedirsValue};
 
 fn main() -> io::Result<()> {
-    Token::Array(Some(&[Token::SimpleString("ollare"), Token::Integer(12)]))
-        .write_resp_str(&mut std::io::stdout())
+    RedirsValue::Array(Some(vec![
+        RedirsValue::SimpleString("ollare".into()),
+        RedirsValue::Integer(12),
+    ]))
+    .write_resp_str(&mut std::io::stdout())
 }

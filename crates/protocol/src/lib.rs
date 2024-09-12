@@ -1,9 +1,15 @@
 use std::{
     borrow::Cow,
+    collections::{BTreeMap, HashSet},
+    fmt::Display,
     io::{self, Write},
 };
 
 const SPACER: &str = "\r\n";
+
+pub trait RedirsOutput {
+    fn write_resp_str<T: Write>(&self, out: &mut T) -> io::Result<()>;
+}
 
 pub enum RedirsError {
     WhitespaceError,
@@ -18,6 +24,35 @@ pub enum ProcVersion {
 }
 
 #[derive(Debug)]
+pub enum Sign {
+    Positive,
+    Negative,
+}
+
+impl Display for Sign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Sign::Positive => "+",
+            Sign::Negative => "-",
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum VerbatimEncoding {
+    Txt,
+    Mrk,
+}
+impl Display for VerbatimEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VerbatimEncoding::Txt => "txt",
+            VerbatimEncoding::Mrk => "mrk",
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct HelloCmd<'a> {
     pub version: Option<ProcVersion>,
     pub auth: Option<(Cow<'a, str>, Cow<'a, str>)>,
@@ -26,63 +61,100 @@ pub struct HelloCmd<'a> {
 
 #[derive(Debug)]
 pub enum Cmd<'a> {
-    Ping(&'a str),
-    Hello(HelloCmd<'a>),
+    System(System<'a>),
+    Action(Action<'a>),
 }
 
 #[derive(Debug)]
-pub enum Token<'a> {
-    SimpleString(&'a str),
-    SimpleError(&'a str),
+pub enum Action<'a> {
+    GET(&'a str),
+    SET((String, RedirsValue)),
+    DEL(&'a str),
+}
+
+#[derive(Debug)]
+pub enum System<'a> {
+    PING(&'a str),
+    HELLO(HelloCmd<'a>),
+    ECHO(&'a str),
+}
+
+#[derive(Debug)]
+pub enum RedirsValue {
+    SimpleString(String),
+    SimpleError(String),
     Integer(i64),
     // this can be pretty huge (max 512 MB)
     BulkString(Option<String>),
-    Array(Option<&'a [Token<'a>]>),
+    Array(Option<Vec<RedirsValue>>),
     Null,
     Bool(bool),
     Double(f64),
-    BigNumber,
-    BulkError,
-    VerbatimString,
-    Map,
-    Set,
-    Push,
+    BigNumber(Sign, String),
+    BulkError(String),
+    VerbatimString(VerbatimEncoding, String),
+    Map(BTreeMap<RedirsValue, RedirsValue>),
+    Set(HashSet<RedirsValue>),
+    Push(Vec<RedirsValue>),
 }
 
-impl<'a> Token<'a> {
-    pub fn write_resp_str<T: Write>(&self, out_buffer: &mut T) -> io::Result<()> {
+impl RedirsOutput for RedirsValue {
+    fn write_resp_str<T: Write>(&self, out: &mut T) -> io::Result<()> {
         match self {
-            Token::SimpleString(s) => write!(out_buffer, "+{s}{SPACER}"),
-            Token::SimpleError(s) => write!(out_buffer, "-{s}{SPACER}"),
-            Token::Integer(i) => write!(out_buffer, ":{i}{SPACER}"),
-            Token::BulkString(s) => match s {
-                Some(s) => write!(out_buffer, "${}{SPACER}{s}{SPACER}", s.len()),
-                None => write!(out_buffer, "$-1{SPACER}"),
+            RedirsValue::SimpleString(s) => write!(out, "+{s}{SPACER}"),
+            RedirsValue::SimpleError(s) => write!(out, "-{s}{SPACER}"),
+            RedirsValue::Integer(i) => write!(out, ":{i}{SPACER}"),
+            RedirsValue::BulkString(s) => match s {
+                Some(s) => write!(out, "${}{SPACER}{s}{SPACER}", s.len()),
+                None => write!(out, "$-1{SPACER}"),
             },
-            Token::Array(arr) => match arr {
+            RedirsValue::Array(arr) => match arr {
                 Some(arr) => {
-                    write!(out_buffer, "*{}{SPACER}", arr.len())?;
+                    write!(out, "*{}{SPACER}", arr.len())?;
                     arr.iter()
-                        .map(|t| t.write_resp_str(out_buffer))
+                        .map(|t| t.write_resp_str(out))
                         .find(|x| x.is_err())
                         .unwrap_or(Ok(()))
                 }
                 None => {
-                    write!(out_buffer, "*-1{SPACER}")
+                    write!(out, "*-1{SPACER}")
                 }
             },
-            Token::Null => write!(out_buffer, "_{SPACER}"),
-            Token::Bool(b) => match b {
-                true => write!(out_buffer, "#t{SPACER}"),
-                false => write!(out_buffer, "#f{SPACER}"),
+            RedirsValue::Null => write!(out, "_{SPACER}"),
+            RedirsValue::Bool(b) => match b {
+                true => write!(out, "#t{SPACER}"),
+                false => write!(out, "#f{SPACER}"),
             },
-            Token::Double(d) => write!(out_buffer, ",{d}{SPACER}"),
-            Token::BigNumber => todo!(),
-            Token::BulkError => todo!(),
-            Token::VerbatimString => todo!(),
-            Token::Map => todo!(),
-            Token::Set => todo!(),
-            Token::Push => todo!(),
+            RedirsValue::Double(d) => write!(out, ",{d}{SPACER}"),
+            RedirsValue::BigNumber(sign, value) => write!(out, "({sign}{value}{SPACER}"),
+            RedirsValue::BulkError(err) => write!(out, "!{}{SPACER}{err}{SPACER}", err.len()),
+            RedirsValue::VerbatimString(enc, s) => {
+                write!(out, "={}{SPACER}{enc}:{s}{SPACER}", s.len() + 4)
+            }
+            RedirsValue::Map(map) => {
+                write!(out, "%{}{SPACER}", map.len())?;
+                map.iter()
+                    .map(|(k, v)| {
+                        k.write_resp_str(out)?;
+                        v.write_resp_str(out)
+                    })
+                    .find(|x| x.is_err())
+                    .unwrap_or(Ok(()))
+            }
+            RedirsValue::Set(set) => {
+                write!(out, "~{}{SPACER}", set.len())?;
+                set.iter()
+                    .map(|v| v.write_resp_str(out))
+                    .find(|x| x.is_err())
+                    .unwrap_or(Ok(()))
+            }
+            RedirsValue::Push(vals) => {
+                write!(out, ">{}{SPACER}", vals.len())?;
+                vals.iter()
+                    .map(|v| v.write_resp_str(out))
+                    .find(|x| x.is_err())
+                    .unwrap_or(Ok(()))
+            }
         }
     }
 }
@@ -115,7 +187,7 @@ impl<'o> Lexer<'o> {
         self.buffer = splits.next().ok_or(RedirsError::StringError)?;
         Ok(out)
     }
-    pub fn lex(&mut self) -> Result<Token<'o>, RedirsError> {
+    pub fn lex(&mut self) -> Result<RedirsValue, RedirsError> {
         Err(RedirsError::ParsingError)
     }
 }

@@ -4,3 +4,5 @@ members = ["crates/protocol"]
 default-members = ["crates/protocol"]
 # exclude = []
 resolver = "2"
+
+[workspace.dependencies]
